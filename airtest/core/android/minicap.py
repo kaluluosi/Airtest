@@ -4,10 +4,10 @@ import re
 import json
 import struct
 import threading
-import traceback
-from airtest.core.android.constant import STFLIB
-from airtest.core.error import AdbShellError
-from airtest.utils.compat import PY3
+import six
+import socket
+from functools import wraps
+from airtest.core.android.constant import STFLIB, ORI_METHOD
 from airtest.utils.logger import get_logger
 from airtest.utils.nbsp import NonBlockingStreamReader
 from airtest.utils.safesocket import SafeSocket
@@ -15,6 +15,17 @@ from airtest.utils.snippet import reg_cleanup, on_method_ready, ready_method
 
 
 LOGGING = get_logger(__name__)
+
+
+def retry_when_socket_error(func):
+    @wraps(func)
+    def wrapper(inst, *args, **kwargs):
+        try:
+            return func(inst, *args, **kwargs)
+        except socket.error:
+            inst.frame_gen = None
+            return func(inst, *args, **kwargs)
+    return wrapper
 
 
 class Minicap(object):
@@ -27,16 +38,19 @@ class Minicap(object):
     RECVTIMEOUT = None
     CMD = "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/minicap"
 
-    def __init__(self, adb, projection=None):
+    def __init__(self, adb, projection=None, ori_function=None):
         """
         :param adb: adb instance of android device
         :param projection: projection, default is None. If `None`, physical display size is used
         """
         self.adb = adb
         self.projection = projection
+        self.ori_function = ori_function if callable(ori_function) else self.get_display_info
         self.frame_gen = None
         self.stream_lock = threading.Lock()
         self.quirk_flag = 0
+        self._stream_rotation = None
+        self._update_rotation_event = threading.Event()
 
     @ready_method
     def install_or_upgrade(self):
@@ -133,6 +147,7 @@ class Minicap(object):
         """
         display_info = self.adb.shell("%s -i" % self.CMD)
         display_info = json.loads(display_info)
+        display_info["orientation"] = display_info["rotation"] / 90
         return display_info
 
     @on_method_ready('install_or_upgrade')
@@ -150,12 +165,13 @@ class Minicap(object):
             jpg data
 
         """
+        params, display_info = self._get_params(projection)
         raw_data = self.adb.raw_shell(
-            self.CMD + " -n 'airtest_minicap' -P %dx%d@%dx%d/%d -s" %
-            self._get_params(projection),
+            self.CMD + " -n 'airtest_minicap' -P %dx%d@%dx%d/%d -s" % params,
             ensure_unicode=False,
         )
-        jpg_data = raw_data.split(b"for JPG encoder" + self.adb.line_breaker)[-1].replace(self.adb.line_breaker, b"\n")
+        jpg_data = raw_data.split(b"for JPG encoder" + self.adb.line_breaker)[-1]
+        jpg_data = jpg_data.replace(self.adb.line_breaker, b"\n")
         return jpg_data
 
     def _get_params(self, projection=None):
@@ -166,10 +182,10 @@ class Minicap(object):
             physical display size (width, height), counted projection (width, height) and real display orientation
 
         """
-        # minicap截屏时，需要截取物理全屏的图片:
-        real_width = self.adb.display_info["physical_width"]
-        real_height = self.adb.display_info["physical_height"]
-        real_orientation = self.adb.display_info["rotation"]
+        display_info = self.ori_function()
+        real_width = display_info["width"]
+        real_height = display_info["height"]
+        real_rotation = display_info["rotation"]
         # 优先去传入的projection
         projection = projection or self.projection
         if projection:
@@ -177,10 +193,12 @@ class Minicap(object):
         else:
             proj_width, proj_height = real_width, real_height
 
-        if self.quirk_flag & 2 and real_orientation != 0:
-            return real_height, real_width, proj_height, proj_width, 0
+        if self.quirk_flag & 2 and real_rotation in (90, 270):
+            params = real_height, real_width, proj_height, proj_width, 0
+        else:
+            params = real_width, real_height, proj_width, proj_height, real_rotation
 
-        return real_width, real_height, proj_width, proj_height, real_orientation
+        return (params, display_info)
 
     @on_method_ready('install_or_upgrade')
     def get_stream(self, lazy=True):
@@ -222,7 +240,7 @@ class Minicap(object):
         # check quirk-bitflags, reference: https://github.com/openstf/minicap#quirk-bitflags
         ori, self.quirk_flag = global_headers[-2:]
 
-        if self.quirk_flag & 2 and ori != 0:
+        if self.quirk_flag & 2 and ori in (1, 3):
             # resetup
             LOGGING.debug("quirk_flag found, going to resetup")
             stopping = True
@@ -252,6 +270,7 @@ class Minicap(object):
         nbsp.kill()
         proc.kill()
         self.adb.remove_forward("tcp:%s" % localport)
+        self.adb.close_proc_pipe(proc)
 
     def _setup_stream_server(self, lazy=False):
         """
@@ -267,7 +286,7 @@ class Minicap(object):
         localport, deviceport = self.adb.setup_forward("localabstract:minicap_{}".format)
         deviceport = deviceport[len("localabstract:"):]
         other_opt = "-l" if lazy else ""
-        params = self._get_params()
+        params, display_info = self._get_params()
         proc = self.adb.start_shell(
             "%s -n '%s' -P %dx%d@%dx%d/%d %s 2>&1" %
             tuple([self.CMD, deviceport] + list(params) + [other_opt]),
@@ -284,9 +303,12 @@ class Minicap(object):
             # minicap server setup error, may be already setup by others
             # subprocess exit immediately
             raise RuntimeError("minicap server quit immediately")
+
         reg_cleanup(proc.kill)
+        self._stream_rotation = int(display_info["rotation"])
         return proc, nbsp, localport
 
+    @retry_when_socket_error
     def get_frame_from_stream(self):
         """
         Get one frame from minicap stream
@@ -295,14 +317,13 @@ class Minicap(object):
             frame
 
         """
-        with self.stream_lock:
-            if self.frame_gen is None:
-                self.frame_gen = self.get_stream()
-            if not PY3:
-                frame = self.frame_gen.next()
-            else:
-                frame = self.frame_gen.__next__()
-            return frame
+        if self._update_rotation_event.is_set():
+            LOGGING.debug("do update rotation")
+            self.teardown_stream()
+            self._update_rotation_event.clear()
+        if self.frame_gen is None:
+            self.frame_gen = self.get_stream()
+        return six.next(self.frame_gen)
 
     def update_rotation(self, rotation):
         """
@@ -316,7 +337,7 @@ class Minicap(object):
 
         """
         LOGGING.debug("update_rotation: %s" % rotation)
-        self.teardown_stream()
+        self._update_rotation_event.set()
 
     def teardown_stream(self):
         """
@@ -326,14 +347,15 @@ class Minicap(object):
             None
 
         """
-        with self.stream_lock:
-            if not self.frame_gen:
-                return
-            try:
-                self.frame_gen.send(1)
-            except (TypeError, StopIteration):
-                # TypeError: can't send non-None value to a just-started generator
-                pass
-            else:
-                LOGGING.warn("%s tear down failed" % self.frame_gen)
-            self.frame_gen = None
+        if not self.frame_gen:
+            return
+        try:
+            self.frame_gen.send(1)
+        except (TypeError, StopIteration):
+            # TypeError: can't send non-None value to a just-started generator
+            pass
+        else:
+            LOGGING.warn("%s tear down failed" % self.frame_gen)
+        self.frame_gen = None
+
+

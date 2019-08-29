@@ -1,7 +1,7 @@
 # _*_ coding:UTF-8 _*_
 import time
 from threading import Thread, Event
-from .compat import queue
+from six.moves import queue
 from .logger import get_logger
 LOGGING = get_logger(__name__)
 
@@ -40,7 +40,7 @@ class NonBlockingStreamReader:
                 elif raise_EOF:
                     raise UnexpectedEndOfStream
                 else:
-                    print("EndOfStream: %s" % self.name)
+                    # print("EndOfStream: %s" % self.name)
                     break
 
         self._kill_event = Event()

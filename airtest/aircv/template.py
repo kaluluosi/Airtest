@@ -1,9 +1,9 @@
 # !/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""[summary] 模板匹配对用户提供的调节参数:
+"""模板匹配.
 
-[description]
+对用户提供的调节参数:
     1. threshod: 筛选阈值，默认为0.8
     2. rgb: 彩色三通道,进行彩色权识别.
 """
@@ -62,7 +62,8 @@ def find_all_template(im_source, im_search, threshold=0.8, rgb=False, max_count=
         result.append(one_good_match)
 
         # 屏蔽已经取出的最优结果,进入下轮循环继续寻找:
-        cv2.floodFill(res, None, max_loc, (-1000,), max(max_val, 0), flags=cv2.FLOODFILL_FIXED_RANGE)
+        # cv2.floodFill(res, None, max_loc, (-1000,), max(max_val, 0), flags=cv2.FLOODFILL_FIXED_RANGE)
+        cv2.rectangle(res, (int(max_loc[0] - w / 2), int(max_loc[1] - h / 2)), (int(max_loc[0] + w / 2), int(max_loc[1] + h / 2)), (0, 0, 0), -1)
 
     return result if result else None
 

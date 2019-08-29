@@ -5,7 +5,7 @@ import sys
 import cv2
 import numpy as np
 from .error import FileNotExistError
-from airtest.utils.compat import PY3
+from six import PY3
 
 
 def imread(filename):
@@ -13,10 +13,7 @@ def imread(filename):
     if not os.path.isfile(filename):
         raise FileNotExistError("File not exist: %s" % filename)
     if PY3:
-        stream = open(filename, "rb")
-        bytes = bytearray(stream.read())
-        numpyarray = np.asarray(bytes, dtype=np.uint8)
-        img = cv2.imdecode(numpyarray, cv2.IMREAD_UNCHANGED)
+        img = cv2.imdecode(np.fromfile(filename, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     else:
         filename = filename.encode(sys.getfilesystemencoding())
         img = cv2.imread(filename, 1)
@@ -25,9 +22,11 @@ def imread(filename):
 
 def imwrite(filename, img):
     """写出图片到本地路径"""
-    if not PY3:
+    if PY3:
+        cv2.imencode('.jpg', img)[1].tofile(filename)
+    else:
         filename = filename.encode(sys.getfilesystemencoding())
-    cv2.imwrite(filename, img)
+        cv2.imwrite(filename, img)
 
 
 def show(img, title="show_img", test_flag=False):
@@ -63,7 +62,7 @@ def rotate(img, angle=90, clockwise=True):
 
     # 将角度旋转转化为逆时针旋转90°的次数:
     counter_rotate_time = (4 - angle / 90) % 4 if clockwise else (angle / 90) % 4
-    for i in range(counter_rotate_time):
+    for i in range(int(counter_rotate_time)):
         img = count_clock_rotate(img)
 
     return img
@@ -92,14 +91,14 @@ def crop_image(img, rect):
         raise Exception("to crop a image, rect should be a list like: [x_min, y_min, x_max, y_max].")
 
 
-def mark_point(img, point):
+def mark_point(img, point, circle=False, color=100, radius=20):
     """ 调试用的: 标记一个点 """
     x, y = point
     # cv2.rectangle(img, (x, y), (x+10, y+10), 255, 1, lineType=cv2.CV_AA)
-    radius = 20
-    cv2.circle(img, (x, y), radius, 255, thickness=2)
-    cv2.line(img, (x-radius, y), (x+radius, y), 100)  # x line
-    cv2.line(img, (x, y-radius), (x, y+radius), 100)  # y line
+    if circle:
+        cv2.circle(img, (x, y), radius, 255, thickness=2)
+    cv2.line(img, (x - radius, y), (x + radius, y), color)  # x line
+    cv2.line(img, (x, y - radius), (x, y + radius), color)  # y line
     return img
 
 

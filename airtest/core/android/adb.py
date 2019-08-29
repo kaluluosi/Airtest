@@ -1,21 +1,27 @@
 # -*- coding: utf-8 -*-
-import subprocess
-import threading
-import platform
-import warnings
-import random
-import time
-import sys
 import os
 import re
-from airtest.core.error import AirtestError, AdbError, AdbShellError, DeviceConnectionError
-from airtest.utils.nbsp import NonBlockingStreamReader
+import sys
+import time
+import random
+import platform
+import warnings
+import subprocess
+import threading
+
+from six import PY3, text_type, binary_type
+from six.moves import reduce
+
+from airtest.core.android.constant import (DEFAULT_ADB_PATH, IP_PATTERN,
+                                           SDK_VERISON_NEW)
+from airtest.core.error import (AdbError, AdbShellError, AirtestError,
+                                DeviceConnectionError)
+from airtest.utils.compat import decode_path
 from airtest.utils.logger import get_logger
+from airtest.utils.nbsp import NonBlockingStreamReader
 from airtest.utils.retry import retries
-from airtest.utils.snippet import reg_cleanup, split_cmd, get_std_encoding
-from airtest.utils.compat import PY3, decode_path
-from airtest.core.android.constant import SDK_VERISON_NEW, DEFAULT_ADB_PATH, IP_PATTERN
-# LOGGING = get_logger('adb')
+from airtest.utils.snippet import get_std_encoding, reg_cleanup, split_cmd
+
 LOGGING = get_logger(__name__)
 
 
@@ -34,7 +40,7 @@ class ADB(object):
         self.connect()
         self._sdk_version = None
         self._line_breaker = None
-        self._display_info = None
+        self._display_info = {}
         self._display_info_lock = threading.Lock()
         self._forward_local_using = []
         self.__class__._instances.append(self)
@@ -49,7 +55,13 @@ class ADB(object):
 
         """
         system = platform.system()
-        adb_path = DEFAULT_ADB_PATH[system]
+        machine = platform.machine()
+        adb_path = DEFAULT_ADB_PATH.get('{}-{}'.format(system, machine))
+        if not adb_path:
+            adb_path = DEFAULT_ADB_PATH.get(system)
+        if not adb_path:
+            raise RuntimeError("No adb executable supports this platform({}-{}).".format(system, machine))
+
         # overwrite uiautomator adb
         if "ANDROID_HOME" in os.environ:
             del os.environ["ANDROID_HOME"]
@@ -166,11 +178,25 @@ class ADB(object):
 
         if proc.returncode > 0:
             # adb connection error
-            if re.search(DeviceConnectionError.DEVICE_CONNECTION_ERROR, stderr):
+            pattern = DeviceConnectionError.DEVICE_CONNECTION_ERROR
+            if isinstance(stderr, binary_type):
+                pattern = pattern.encode("utf-8")
+            if re.search(pattern, stderr):
                 raise DeviceConnectionError(stderr)
             else:
                 raise AdbError(stdout, stderr)
         return stdout
+
+    def close_proc_pipe(self, proc):
+        """close stdin/stdout/stderr of subprocess.Popen."""
+
+        def close_pipe(pipe):
+            if pipe:
+                pipe.close()
+
+        close_pipe(proc.stdin)
+        close_pipe(proc.stdout)
+        close_pipe(proc.stderr)
 
     def devices(self, state=None):
         """
@@ -305,7 +331,7 @@ class ADB(object):
             return out.decode(self.SHELL_ENCODING)
         except UnicodeDecodeError:
             warnings.warn("shell output decode {} fail. repr={}".format(self.SHELL_ENCODING, repr(out)))
-            return unicode(repr(out))
+            return text_type(repr(out))
 
     def shell(self, cmd):
         """
@@ -509,13 +535,20 @@ class ADB(object):
         if local in self._forward_local_using:
             self._forward_local_using.remove(local)
 
-    def install_app(self, filepath, replace=False):
+    def install_app(self, filepath, replace=False, install_options=None):
         """
         Perform `adb install` command
 
         Args:
             filepath: full path to file to be installed on the device
             replace: force to replace existing application, default is False
+
+                e.g.["-t",  # allow test packages
+                    "-l",  # forward lock application,
+                    "-s",  # install application on sdcard,
+                    "-d",  # allow version code downgrade (debuggable packages only)
+                    "-g",  # grant all runtime permissions
+                ]
 
         Returns:
             command output
@@ -524,11 +557,65 @@ class ADB(object):
         if isinstance(filepath, str):
             filepath = decode_path(filepath)
 
-        if not replace:
-            cmds = ["install", filepath]
-        else:
-            cmds = ["install", "-r", filepath]
+        if not os.path.isfile(filepath):
+            raise RuntimeError("file: %s does not exists" % (repr(filepath)))
+
+        if not install_options or type(install_options) != list:
+            install_options = []
+        if replace:
+            install_options.append("-r")
+        cmds = ["install", ] + install_options + [filepath, ]
         out = self.cmd(cmds)
+
+        if re.search(r"Failure \[.*?\]", out):
+            print(out)
+            raise AirtestError("Installation Failure")
+
+        return out
+
+    def install_multiple_app(self, filepath, replace=False, install_options=None):
+        """
+            Perform `adb install-multiple` command
+
+            Args:
+                filepath: full path to file to be installed on the device
+                replace: force to replace existing application, default is False
+                install_options:  list of options
+                    e.g.["-t",  # allow test packages
+                        "-l",  # forward lock application,
+                        "-s",  # install application on sdcard,
+                        "-d",  # allow version code downgrade (debuggable packages only)
+                        "-g",  # grant all runtime permissions
+                        "-p",  # partial application install (install-multiple only)
+                    ]
+
+            Returns:
+                command output
+        """
+        if isinstance(filepath, str):
+            filepath = decode_path(filepath)
+
+        if not os.path.isfile(filepath):
+            raise RuntimeError("file: %s does not exists" % (repr(filepath)))
+
+        if not install_options or type(install_options) != list:
+            install_options = []
+        if replace:
+            install_options.append("-r")
+        cmds = ["install-multiple", ] + install_options + [filepath, ]
+
+        try:
+            out = self.cmd(cmds)
+        except AdbError as err:
+            if "Failed to finalize session".lower() in err.stderr.lower():
+                return "Success"
+            else:
+                return self.install_app(filepath, replace)
+
+        if re.search(r"Failure \[.*?\]", out):
+            print(out)
+            raise AirtestError("Installation Failure")
+
         return out
 
     def pm_install(self, filepath, replace=False):
@@ -693,7 +780,21 @@ class ADB(object):
         except AdbShellError:
             return False
         else:
-            return not("No such file or directory" in out)
+            return not ("No such file or directory" in out)
+
+    def file_size(self, filepath):
+        """
+        Get the file size
+
+        Args:
+            filepath: path to the file
+
+        Returns:
+            The file size
+        """
+        out = self.shell(["ls", "-l", filepath])
+        file_size = int(out.split()[3])
+        return file_size
 
     def _cleanup_forwards(self):
         """
@@ -720,8 +821,8 @@ class ADB(object):
             if self.sdk_version >= SDK_VERISON_NEW:
                 line_breaker = os.linesep
             else:
-                line_breaker = b'\r' + os.linesep
-            self._line_breaker = line_breaker
+                line_breaker = '\r' + os.linesep
+            self._line_breaker = line_breaker.encode("ascii")
         return self._line_breaker
 
     @property
@@ -751,12 +852,17 @@ class ADB(object):
 
         """
         display_info = self.getPhysicalDisplayInfo()
-        display_info["orientation"] = self.getDisplayOrientation()
-        display_info["rotation"] = display_info["orientation"] * 90
-        display_info["max_x"], display_info["max_y"] = self._getMaxXY()
+        orientation = self.getDisplayOrientation()
+        max_x, max_y = self.getMaxXY()
+        display_info.update({
+            "orientation": orientation,
+            "rotation": orientation * 90,
+            "max_x": max_x,
+            "max_y": max_y,
+        })
         return display_info
 
-    def _getMaxXY(self):
+    def getMaxXY(self):
         """
         Get device display maximum values for x and y coordinates
 
@@ -780,45 +886,9 @@ class ADB(object):
                     max_y = int(ret.group(0).split()[1])
         return max_x, max_y
 
-    def getPhysicalDisplayInfo(self):
+    def getRestrictedScreen(self):
         """
-        Display size and resolution to be obtained:
-            1. physical display size (physical_width, physical_height) of the device - this is used by `minitouch` as a
-               coordinates system
-            1. screen effective resolution (width, height) - this is used by game image adaptation as a coordinates
-               system
-            1. click range resolution (max_x, max_y)
-
-        Returns:
-            display size and resolution information
-
-        """
-
-        info = self._getPhysicalDisplayInfo()
-        # record the width of physical display (used for screen mapping)
-        if info["width"] > info["height"]:
-            info["physical_height"], info["physical_width"] = info["width"], info["height"]
-        else:
-            info["physical_width"], info["physical_height"] = info["width"], info["height"]
-        # get the screen effective resolution (e.g., the device with soft keys requires resolution removal)
-        mRestrictedScreen = self._getRestrictedScreen()
-        if mRestrictedScreen:
-            info["width"], info["height"] = mRestrictedScreen
-        # as the mRestrictedScreen is related to the horizontal and vertical state of the device, the custom settings
-        # for height and width are set here
-        if info["width"] > info["height"]:
-            info["height"], info["width"] = info["width"], info["height"]
-        # for a special device, do the special treatment
-        special_device_list = ["5fde825d043782fc", "320496728874b1a5"]
-        if self.serialno in special_device_list:
-            # for these devices: width > hight, swap the width and the height
-            info["height"], info["width"] = info["width"], info["height"]
-            info["physical_width"], info["physical_height"] = info["physical_height"], info["physical_width"]
-        return info
-
-    def _getRestrictedScreen(self):
-        """
-        Get value for mRestrictedScreen from `adb -s sno shell dumpsys window`
+        Get value for mRestrictedScreen (without black border / virtual keyboard)`
 
         Returns:
             screen resolution mRestrictedScreen value as tuple (x, y)
@@ -837,7 +907,7 @@ class ADB(object):
 
         return result
 
-    def _getPhysicalDisplayInfo(self):
+    def getPhysicalDisplayInfo(self):
         """
         Get value for display dimension and density from `mPhysicalDisplayInfo` value obtained from `dumpsys` command.
 
@@ -857,17 +927,6 @@ class ADB(object):
                 displayInfo[prop] = float(m.group(prop))
             return displayInfo
 
-        # gets C{mPhysicalDisplayInfo} values from dumpsys. This is a method to obtain display dimensions and density
-        phyDispRE = re.compile('Physical size: (?P<width>\d+)x(?P<height>\d+).*Physical density: (?P<density>\d+)', re.S)
-        m = phyDispRE.search(self.raw_shell('wm size; wm density'))
-        if m:
-            displayInfo = {}
-            for prop in ['width', 'height']:
-                displayInfo[prop] = int(m.group(prop))
-            for prop in ['density']:
-                displayInfo[prop] = float(m.group(prop))
-            return displayInfo
-
         # This could also be mSystem or mOverscanScreen
         phyDispRE = re.compile('\s*mUnrestrictedScreen=\((?P<x>\d+),(?P<y>\d+)\) (?P<width>\d+)x(?P<height>\d+)')
         # This is known to work on older versions (i.e. API 10) where mrestrictedScreen is not available
@@ -881,7 +940,7 @@ class ADB(object):
             for prop in ['width', 'height']:
                 displayInfo[prop] = int(m.group(prop))
             for prop in ['density']:
-                d = self.__getDisplayDensity(None, strip=True)
+                d = self._getDisplayDensity(None, strip=True)
                 if d:
                     displayInfo[prop] = d
                 else:
@@ -889,7 +948,20 @@ class ADB(object):
                     displayInfo[prop] = -1.0
             return displayInfo
 
-    def __getDisplayDensity(self, key, strip=True):
+        # gets C{mPhysicalDisplayInfo} values from dumpsys. This is a method to obtain display dimensions and density
+        phyDispRE = re.compile('Physical size: (?P<width>\d+)x(?P<height>\d+).*Physical density: (?P<density>\d+)', re.S)
+        m = phyDispRE.search(self.raw_shell('wm size; wm density'))
+        if m:
+            displayInfo = {}
+            for prop in ['width', 'height']:
+                displayInfo[prop] = int(m.group(prop))
+            for prop in ['density']:
+                displayInfo[prop] = float(m.group(prop))
+            return displayInfo
+
+        return {}
+
+    def _getDisplayDensity(self, key, strip=True):
         """
         Get display density
 
@@ -934,8 +1006,8 @@ class ADB(object):
             return int(m.group(1))
 
         # We couldn't obtain the orientation
-        # Guess by height > width
-        return 0 if self.display_info["height"] > self.display_info['width'] else 1
+        warnings.warn("Could not obtain the orientation, return 0")
+        return 0
 
     def get_top_activity(self):
         """
@@ -950,9 +1022,10 @@ class ADB(object):
         """
         dat = self.shell('dumpsys activity top')
         activityRE = re.compile('\s*ACTIVITY ([A-Za-z0-9_.]+)/([A-Za-z0-9_.]+) \w+ pid=(\d+)')
-        m = activityRE.search(dat)
+        # in Android8.0 or higher, the result may be more than one
+        m = activityRE.findall(dat)
         if m:
-            return (m.group(1), m.group(2), m.group(3))
+            return m[-1]
         else:
             raise AirtestError("Can not get top activity, output:%s" % dat)
 
@@ -996,11 +1069,8 @@ class ADB(object):
         Returns:
             True or False whether the screen is locked or not
 
-        Notes:
-            Does not work on Xiaomi 2S
-
         """
-        lockScreenRE = re.compile('mShowingLockscreen=(true|false)')
+        lockScreenRE = re.compile('(?:mShowingLockscreen|isStatusBarKeyguard)=(true|false)')
         m = lockScreenRE.search(self.shell('dumpsys window policy'))
         if not m:
             raise AirtestError("Couldn't determine screen lock state")
@@ -1106,8 +1176,10 @@ class ADB(object):
             True if package has been found
 
         """
-        output = self.shell(['dumpsys', 'package', package]).strip()
-        if package not in output:
+        output = self.shell(['dumpsys', 'package', package])
+        pattern = r'Package\s+\[' + str(package) + '\]'
+        match = re.search(pattern, output)
+        if match is None:
             raise AirtestError('package "{}" not found'.format(package))
         return True
 
@@ -1128,6 +1200,29 @@ class ADB(object):
             self.shell(['monkey', '-p', package, '-c', 'android.intent.category.LAUNCHER', '1'])
         else:
             self.shell(['am', 'start', '-n', '%s/%s.%s' % (package, package, activity)])
+
+    def start_app_timing(self, package, activity):
+        """
+        Start the application and activity, and measure time
+
+        Args:
+            package: package name
+            activity: activity name
+
+        Returns:
+            app launch time
+
+        """
+        out = self.shell(['am', 'start', '-S', '-W', '%s/%s' % (package, activity),
+                          '-c', 'android.intent.category.LAUNCHER', '-a', 'android.intent.action.MAIN'])
+        if not re.search(r"Status:\s*ok", out):
+            raise AirtestError("Starting App: %s/%s Failed!" % (package, activity))
+
+        matcher = re.search(r"ThisTime:\s*(\d+)", out)
+        if matcher:
+            return int(matcher.group(1))
+        else:
+            return 0
 
     def stop_app(self, package):
         """
@@ -1166,29 +1261,38 @@ class ADB(object):
             None if no IP address has been found, otherwise return the IP address
 
         """
-        try:
-            res = self.shell('netcfg')
-        except AdbShellError:
-            res = ''
-        matcher = re.search(r'wlan0.* ((\d+\.){3}\d+)/\d+', res)
-        if matcher:
-            return matcher.group(1)
-        else:
+
+        def get_ip_address_from_interface(interface):
             try:
-                res = self.shell('ifconfig')
+                res = self.shell('netcfg')
             except AdbShellError:
                 res = ''
-            matcher = re.search(r'wlan0.*?inet addr:((\d+\.){3}\d+)', res, re.DOTALL)
+            matcher = re.search(interface + r'.* ((\d+\.){3}\d+)/\d+', res)
             if matcher:
                 return matcher.group(1)
             else:
                 try:
-                    res = self.shell('getprop dhcp.wlan0.ipaddress')
+                    res = self.shell('ifconfig')
                 except AdbShellError:
                     res = ''
-                matcher = IP_PATTERN.search(res)
+                matcher = re.search(interface + r'.*?inet addr:((\d+\.){3}\d+)', res, re.DOTALL)
                 if matcher:
-                    return matcher.group(0)
+                    return matcher.group(1)
+                else:
+                    try:
+                        res = self.shell('getprop dhcp.{}.ipaddress'.format(interface))
+                    except AdbShellError:
+                        res = ''
+                    matcher = IP_PATTERN.search(res)
+                    if matcher:
+                        return matcher.group(0)
+            return None
+
+        interfaces = ('eth0', 'eth1', 'wlan0')
+        for i in interfaces:
+            ip = get_ip_address_from_interface(i)
+            if ip and not ip.startswith('172.') and not ip.startswith('127.') and not ip.startswith('169.'):
+                return ip
         return None
 
     def get_gateway_address(self):
@@ -1236,6 +1340,124 @@ class ADB(object):
         # 获取不到网段长度就默认取17
         print('[iputils WARNING] fail to get subnet mask len. use 17 as default.')
         return 17
+
+    def get_memory(self):
+        res = self.shell("dumpsys meminfo")
+        pat = re.compile(r".*Total RAM:\s+(\S+)\s+", re.DOTALL)
+        _str = pat.match(res).group(1)
+        if ',' in _str:
+            _list = _str.split(',')
+            _num = int(_list[0])
+            _num = round(_num + (float(_list[1]) / 1000.0))
+        else:
+            _num = round(float(_str) / 1000.0 / 1000.0)
+        res = str(_num) + 'G'
+        return res
+
+    def get_storage(self):
+        res = self.shell("df /data")
+        pat = re.compile(r".*\/data\s+(\S+)", re.DOTALL)
+        if pat.match(res):
+            _str = pat.match(res).group(1)
+        else:
+            pat = re.compile(r".*\s+(\S+)\s+\S+\s+\S+\s+\S+\s+\/data", re.DOTALL)
+            _str = pat.match(res).group(1)
+        if 'G' in _str:
+            _num = round(float(_str[:-1]))
+        elif 'M' in _str:
+            _num = round(float(_str[:-1]) / 1000.0)
+        else:
+            _num = round(float(_str) / 1000.0 / 1000.0)
+        if _num > 64:
+            res = '128G'
+        elif _num > 32:
+            res = '64G'
+        elif _num > 16:
+            res = '32G'
+        elif _num > 8:
+            res = '16G'
+        else:
+            res = '8G'
+        return res
+
+    def get_cpuinfo(self):
+        res = self.shell("cat /proc/cpuinfo").strip()
+        cpuNum = res.count("processor")
+        pat = re.compile(r'Hardware\s+:\s+(\w+.*)')
+        m = pat.match(res)
+        if not m:
+            pat = re.compile(r'Processor\s+:\s+(\w+.*)')
+            m = pat.match(res)
+        cpuName = m.group(1).replace('\r', '')
+        return dict(cpuNum=cpuNum, cpuName=cpuName)
+
+    def get_cpufreq(self):
+        res = self.shell("cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+        num = round(float(res) / 1000 / 1000, 1)
+        res = str(num) + 'GHz'
+        return res.strip()
+
+    def get_cpuabi(self):
+        res = self.shell("getprop ro.product.cpu.abi")
+        return res.strip()
+
+    def get_gpu(self):
+        res = self.shell("dumpsys SurfaceFlinger")
+        pat = re.compile(r'GLES:\s+(.*)')
+        m = pat.search(res)
+        if not m:
+            return None
+        _list = m.group(1).split(',')
+        gpuModel = ""
+        opengl = ""
+        if len(_list) > 0:
+            gpuModel = _list[1].strip()
+        if len(_list) > 1:
+            m2 = re.search(r'(\S+\s+\S+\s+\S+).*', _list[2])
+            if m2:
+                opengl = m2.group(1)
+        return dict(gpuModel=gpuModel, opengl=opengl)
+
+    def get_model(self):
+        return self.getprop("ro.product.model")
+
+    def get_manufacturer(self):
+        return self.getprop("ro.product.manufacturer")
+
+    def get_device_info(self):
+        """
+        Get android device information, including: memory/storage/display/cpu/gpu/model/manufacturer...
+
+        Returns:
+            Dict of info
+
+        """
+        handlers = {
+            "platform": "Android",
+            "serialno": self.serialno,
+            "memory": self.get_memory,
+            "storage": self.get_storage,
+            "display": self.getPhysicalDisplayInfo,
+            "cpuinfo": self.get_cpuinfo,
+            "cpufreq": self.get_cpufreq,
+            "cpuabi": self.get_cpuabi,
+            "sdkversion": self.sdk_version,
+            "gpu": self.get_gpu,
+            "model": self.get_model,
+            "manufacturer": self.get_manufacturer,
+            # "battery": getBatteryCapacity
+        }
+        ret = {}
+        for k, v in handlers.items():
+            if callable(v):
+                try:
+                    value = v()
+                except Exception:
+                    value = None
+                ret[k] = value
+            else:
+                ret[k] = v
+        return ret
 
 
 def cleanup_adb_forward():

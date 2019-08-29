@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 
 from .error import *  # noqa
-from .utils import generate_result, check_source_larger_than_search
+from .utils import generate_result, check_image_valid
 from .cal_confidence import cal_ccoeff_confidence, cal_rgb_confidence
 
 # SIFT识别特征点匹配，参数设置:
@@ -19,8 +19,9 @@ ONE_POINT_CONFI = 0.5
 
 def find_sift(im_source, im_search, threshold=0.8, rgb=True, good_ratio=FILTER_RATIO):
     """基于sift进行图像识别，只筛选出最优区域."""
-    # 第一步：校验图像输入
-    check_source_larger_than_search(im_source, im_search)
+    # 第一步：检验图像是否正常：
+    if not check_image_valid(im_source, im_search):
+        return None
 
     # 第二步：获取特征点集并匹配出特征点对: 返回值 good, pypts, kp_sch, kp_src
     kp_sch, kp_src, good = _get_key_points(im_source, im_search, good_ratio)
@@ -248,10 +249,17 @@ def _two_good_points(pts_sch1, pts_sch2, pts_src1, pts_src2, im_search, im_sourc
 
 def _find_homography(sch_pts, src_pts):
     """多组特征点对时，求取单向性矩阵."""
-    M, mask = cv2.findHomography(sch_pts, src_pts, cv2.RANSAC, 5.0)
-    if mask is None:
-        raise HomographyError("In findHomography(), find no mask...")
-    return M, mask
+    try:
+        M, mask = cv2.findHomography(sch_pts, src_pts, cv2.RANSAC, 5.0)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise HomographyError("OpenCV error in _find_homography()...")
+    else:
+        if mask is None:
+            raise HomographyError("In _find_homography(), find no mask...")
+        else:
+            return M, mask
 
 
 def _target_error_check(w_h_range):

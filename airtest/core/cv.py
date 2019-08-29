@@ -2,18 +2,35 @@
 # -*- coding: utf-8 -*-
 
 """"Airtest图像识别专用."""
+
 import os
 import sys
 import time
 import types
+from six import PY3
+from copy import deepcopy
+
 from airtest import aircv
 from airtest.aircv import cv2
-from airtest.core.error import TargetNotFoundError
-from airtest.core.helper import G, logwrap, log_in_func
-from airtest.core.settings import Settings as ST
+from airtest.core.helper import G, logwrap
+from airtest.core.settings import Settings as ST  # noqa
+from airtest.core.error import TargetNotFoundError, InvalidMatchingMethodError
 from airtest.utils.transform import TargetPos
-from airtest.utils.compat import PY3
-from copy import deepcopy
+
+from airtest.aircv.template_matching import TemplateMatching
+from airtest.aircv.keypoint_matching import KAZEMatching, BRISKMatching, AKAZEMatching, ORBMatching
+from airtest.aircv.keypoint_matching_contrib import SIFTMatching, SURFMatching, BRIEFMatching
+
+MATCHING_METHODS = {
+    "tpl": TemplateMatching,
+    "kaze": KAZEMatching,
+    "brisk": BRISKMatching,
+    "akaze": AKAZEMatching,
+    "orb": ORBMatching,
+    "sift": SIFTMatching,
+    "surf": SURFMatching,
+    "brief": BRIEFMatching,
+}
 
 
 @logwrap
@@ -44,6 +61,8 @@ def loop_find(query, timeout=ST.FIND_TIMEOUT, threshold=None, interval=0.5, inte
         if screen is None:
             G.LOGGING.warning("Screen is None, may be locked")
         else:
+            if threshold:
+                query.threshold = threshold
             match_pos = query.match_in(screen)
             if match_pos:
                 try_log_screen(screen)
@@ -60,6 +79,7 @@ def loop_find(query, timeout=ST.FIND_TIMEOUT, threshold=None, interval=0.5, inte
             time.sleep(interval)
 
 
+@logwrap
 def try_log_screen(screen=None):
     """
     Save screenshot to file
@@ -78,7 +98,7 @@ def try_log_screen(screen=None):
     filename = "%(time)d.jpg" % {'time': time.time() * 1000}
     filepath = os.path.join(ST.LOG_DIR, filename)
     aircv.imwrite(filepath, screen)
-    log_in_func({"screen": filename})
+    return filename
 
 
 class Template(object):
@@ -93,12 +113,23 @@ class Template(object):
 
     def __init__(self, filename, threshold=None, target_pos=TargetPos.MID, record_pos=None, resolution=(), rgb=False):
         self.filename = filename
-        self.filepath = os.path.join(G.BASEDIR, filename) if G.BASEDIR else filename
+        self._filepath = None
         self.threshold = threshold or ST.THRESHOLD
         self.target_pos = target_pos
         self.record_pos = record_pos
         self.resolution = resolution
         self.rgb = rgb
+
+    @property
+    def filepath(self):
+        if self._filepath:
+            return self._filepath
+        for dirname in G.BASEDIR:
+            filepath = os.path.join(dirname, self.filename)
+            if os.path.isfile(filepath):
+                self._filepath = filepath
+                return self._filepath
+        return self.filename
 
     def __repr__(self):
         filepath = self.filepath if PY3 else self.filepath.encode(sys.getfilesystemencoding())
@@ -107,7 +138,6 @@ class Template(object):
     def match_in(self, screen):
         match_result = self._cv_match(screen)
         G.LOGGING.debug("match result: %s", match_result)
-        log_in_func({"cv": match_result})
         if not match_result:
             return None
         focus_pos = TargetPos().getXY(match_result, self.target_pos)
@@ -118,29 +148,31 @@ class Template(object):
         image = self._resize_image(image, screen, ST.RESIZE_METHOD)
         return self._find_all_template(image, screen)
 
+    @logwrap
     def _cv_match(self, screen):
         # in case image file not exist in current directory:
         image = self._imread()
         image = self._resize_image(image, screen, ST.RESIZE_METHOD)
         ret = None
         for method in ST.CVSTRATEGY:
-            if method == "tpl":
-                ret = self._try_match(self._find_template, image, screen)
-            elif method == "sift":
-                ret = self._try_match(self._find_sift_in_predict_area, image, screen)
-                if not ret:
-                    ret = self._try_match(self._find_sift, image, screen)
+            # get function definition and execute:
+            func = MATCHING_METHODS.get(method, None)
+            if func is None:
+                raise InvalidMatchingMethodError("Undefined method in CVSTRATEGY: '%s', try 'kaze'/'brisk'/'akaze'/'orb'/'surf'/'sift'/'brief' instead." % method)
             else:
-                G.LOGGING.warning("Undefined method in CV_STRATEGY: %s", method)
+                ret = self._try_match(func, image, screen, threshold=self.threshold, rgb=self.rgb)
             if ret:
                 break
         return ret
 
     @staticmethod
-    def _try_match(method, *args, **kwargs):
-        G.LOGGING.debug("try match with %s" % method.__name__)
+    def _try_match(func, *args, **kwargs):
+        G.LOGGING.debug("try match with %s" % func.__name__)
         try:
-            ret = method(*args, **kwargs)
+            ret = func(*args, **kwargs).find_best_result()
+        except aircv.NoModuleError as err:
+            G.LOGGING.debug("'surf'/'sift'/'brief' is in opencv-contrib module. You can use 'tpl'/'kaze'/'brisk'/'akaze'/'orb' in CVSTRATEGY, or reinstall opencv with the contrib module.")
+            return None
         except aircv.BaseError as err:
             G.LOGGING.debug(repr(err))
             return None
@@ -151,29 +183,27 @@ class Template(object):
         return aircv.imread(self.filepath)
 
     def _find_all_template(self, image, screen):
-        return aircv.find_all_template(screen, image, threshold=self.threshold, rgb=self.rgb)
+        return TemplateMatching(image, screen, threshold=self.threshold, rgb=self.rgb).find_all_results()
 
-    def _find_template(self, image, screen):
-        return aircv.find_template(screen, image, threshold=self.threshold, rgb=self.rgb)
-
-    def _find_sift(self, image, screen):
-        return aircv.find_sift(screen, image, threshold=self.threshold, rgb=self.rgb)
-
-    def _find_sift_in_predict_area(self, image, screen):
+    def _find_keypoint_result_in_predict_area(self, func, image, screen):
         if not self.record_pos:
             return None
         # calc predict area in screen
-        screen_resolution = aircv.get_resolution(screen)
-        xmin, ymin, xmax, ymax = Predictor.get_predict_area(self.record_pos, screen_resolution)
+        image_wh, screen_resolution = aircv.get_resolution(image), aircv.get_resolution(screen)
+        xmin, ymin, xmax, ymax = Predictor.get_predict_area(self.record_pos, image_wh, self.resolution, screen_resolution)
         # crop predict image from screen
         predict_area = aircv.crop_image(screen, (xmin, ymin, xmax, ymax))
-        # aircv.show(predict_area)
-        # find sift in that image
-        ret_in_area = aircv.find_sift(predict_area, image, threshold=self.threshold, rgb=self.rgb)
+        if not predict_area.any():
+            return None
+        # keypoint matching in predicted area:
+        ret_in_area = func(image, predict_area, threshold=self.threshold, rgb=self.rgb)
         # calc cv ret if found
         if not ret_in_area:
             return None
         ret = deepcopy(ret_in_area)
+        if "rectangle" in ret:
+            for idx, item in enumerate(ret["rectangle"]):
+                ret["rectangle"][idx] = (item[0] + xmin, item[1] + ymin)
         ret["result"] = (ret_in_area["result"][0] + xmin, ret_in_area["result"][1] + ymin)
         return ret
 
@@ -206,12 +236,11 @@ class Predictor(object):
     this class predicts the press_point and the area to search im_search.
     """
 
-    RADIUS_X = 250
-    RADIUS_Y = 250
+    DEVIATION = 100
 
     @staticmethod
     def count_record_pos(pos, resolution):
-        """计算坐标对应的中点偏移值相对于分辨率的百分比"""
+        """计算坐标对应的中点偏移值相对于分辨率的百分比."""
         _w, _h = resolution
         # 都按宽度缩放，针对G18的实验结论
         delta_x = (pos[0] - _w * 0.5) / _w
@@ -222,7 +251,7 @@ class Predictor(object):
 
     @classmethod
     def get_predict_point(cls, record_pos, screen_resolution):
-        """预测缩放后的点击位置点"""
+        """预测缩放后的点击位置点."""
         delta_x, delta_y = record_pos
         _w, _h = screen_resolution
         target_x = delta_x * _w + _w * 0.5
@@ -230,7 +259,14 @@ class Predictor(object):
         return target_x, target_y
 
     @classmethod
-    def get_predict_area(cls, record_pos, screen_resolution):
+    def get_predict_area(cls, record_pos, image_wh, image_resolution=(), screen_resolution=()):
+        """Get predicted area in screen."""
         x, y = cls.get_predict_point(record_pos, screen_resolution)
-        area = (x - cls.RADIUS_X, y - cls.RADIUS_Y, x + cls.RADIUS_X, y + cls.RADIUS_Y)
+        # The prediction area should depend on the image size:
+        if image_resolution:
+            predict_x_radius = int(image_wh[0] * screen_resolution[0] / (2 * image_resolution[0])) + cls.DEVIATION
+            predict_y_radius = int(image_wh[1] * screen_resolution[1] / (2 * image_resolution[1])) + cls.DEVIATION
+        else:
+            predict_x_radius, predict_y_radius = int(image_wh[0] / 2) + cls.DEVIATION, int(image_wh[1] / 2) + cls.DEVIATION
+        area = (x - predict_x_radius, y - predict_y_radius, x + predict_x_radius, y + predict_y_radius)
         return area

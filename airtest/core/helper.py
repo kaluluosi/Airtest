@@ -2,6 +2,7 @@
 import functools
 import shutil
 import time
+import sys
 import os
 from airtest.core.settings import Settings as ST
 from airtest.utils.logwraper import Logwrap, AirtestLogger
@@ -10,7 +11,7 @@ from airtest.utils.logger import get_logger
 
 class G(object):
     """Represent the globals variables"""
-    BASEDIR = None
+    BASEDIR = []
     LOGGER = AirtestLogger(None)
     LOGGING = get_logger("airtest.core.api")
     SCREEN = None
@@ -51,8 +52,6 @@ helper functions
 def set_logdir(dirpath):
     """set log dir for logfile and screenshots.
 
-    And create dir at `dirpath/ST.SCREEN_DIR` for screenshots
-
     Args:
         dirpath: directory to save logfile and screenshots
 
@@ -65,25 +64,37 @@ def set_logdir(dirpath):
     G.LOGGER.set_logfile(os.path.join(ST.LOG_DIR, ST.LOG_FILE))
 
 
-def log(tag, data, in_stack=True):
-    if G.LOGGER:
-        G.LOGGER.log(tag, data, in_stack)
+def log(message, traceback=""):
+    """
+    Insert user log, will be displayed in Html report.
 
-
-def log_in_func(data):
+    :param message: log message
+    :param traceback: log traceback if exists, use traceback.format_exc to get best format
+    :return: None
+    """
     if G.LOGGER:
-        G.LOGGER.extra_log.update(data)
+        G.LOGGER.log("info", {"name": message, "traceback": traceback}, 0)
 
 
 def logwrap(f):
     return Logwrap(f, G.LOGGER)
 
 
-def device_platform():
-    return G.DEVICE.__class__.__name__
+def device_platform(device=None):
+    if not device:
+        device = G.DEVICE
+    return device.__class__.__name__
 
 
-NATIVE_PFS = ["Android", "Windows", "IOS"]
+def using(path):
+    if not os.path.isabs(path):
+        abspath = os.path.join(ST.PROJECT_ROOT, path)
+        if os.path.exists(abspath):
+            path = abspath
+    G.LOGGING.debug("using path: %s", path)
+    if path not in sys.path:
+        sys.path.append(path)
+    G.BASEDIR.append(path)
 
 
 def import_device_cls(platform):
@@ -92,29 +103,16 @@ def import_device_cls(platform):
     if platform in G.CUSTOM_DEVICES:
         cls = G.CUSTOM_DEVICES[platform]
     elif platform == "android":
-        from .android import Android as cls
+        from airtest.core.android.android import Android as cls
     elif platform == "windows":
-        from .win import Windows as cls
+        from airtest.core.win.win import Windows as cls
     elif platform == "ios":
-        from .ios import IOS as cls
+        from airtest.core.ios.ios import IOS as cls
+    elif platform == "linux":
+        from airtest.core.linux.linux import Linux as cls
     else:
         raise RuntimeError("Unknown platform: %s" % platform)
     return cls
-
-
-def on_platform(platforms):
-    def decorator(f):
-        @functools.wraps(f)
-        def wrapper(*args, **kwargs):
-            if G.DEVICE is None:
-                raise RuntimeError("Device not connected yet.")
-            pf = device_platform()
-            if pf in NATIVE_PFS and pf not in platforms:
-                raise NotImplementedError("Method not implememted on {}. required {}.".format(pf, platforms))
-            r = f(*args, **kwargs)
-            return r
-        return wrapper
-    return decorator
 
 
 def delay_after_operation():

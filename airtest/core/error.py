@@ -19,6 +19,14 @@ class AirtestError(BaseError):
     pass
 
 
+class InvalidMatchingMethodError(BaseError):
+    """
+        This is InvalidMatchingMethodError BaseError
+        When an invalid matching method is used in settings.
+    """
+    pass
+
+
 class TargetNotFoundError(AirtestError):
     """
         This is TargetNotFoundError BaseError
@@ -59,7 +67,7 @@ class DeviceConnectionError(BaseError):
     """
         device connection error
     """
-    DEVICE_CONNECTION_ERROR = r"error:\s*((device \'\w+\' not found)|(cannot connect to daemon at [\w\:\s\.]+ Connection timed out))"
+    DEVICE_CONNECTION_ERROR = r"error:\s*((device \'\S+\' not found)|(cannot connect to daemon at [\w\:\s\.]+ Connection timed out))"
     pass
 
 
